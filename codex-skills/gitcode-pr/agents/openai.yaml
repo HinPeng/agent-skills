@@ -1,0 +1,4 @@
+interface:
+  display_name: "GitCode Issue and PR"
+  short_description: "Prepare and safely execute GitCode issues and PRs"
+  default_prompt: "Use $gitcode-pr to inspect this repository, prepare a repository-compliant GitCode issue and PR plan, and execute only the writes I request."
