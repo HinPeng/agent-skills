@@ -1,4 +1,4 @@
 interface:
   display_name: "Inductor Kernel Compile Debug"
   short_description: "Isolate one Inductor compile or prerun failure"
-  default_prompt: "Use $inductor-kernel-compile-debug to isolate this Inductor compile or prerun failure into a standalone single-kernel reproducer."
+  default_prompt: "Use $inductor-kernel-compile-debug to isolate this Inductor compile or prerun failure into a direct fixed-config standalone Triton kernel reproducer."

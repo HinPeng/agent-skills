@@ -15,6 +15,11 @@ serializing unrelated Inductor kernels. The packaged scripts target the
 - `scripts/repro_compile.py` replays one captured compile or prerun attempt and
   exports an independent reproducer.
 
+An exported reproducer is a direct fixed-config Triton program. It strips the
+outer Inductor heuristic decorator and calls `ASTSource`, `GPUTarget`,
+`triton.compile`, and the compiled-kernel runner directly; it does not discover
+an `NPUCachingAutotuner` or call `make_launcher`.
+
 Run both scripts in the exact failing environment. Generated source, serialized
 NPU tensors, compiler behavior, and device binaries are stack- and
 hardware-specific; a reference machine is not proof of reproduction on the
@@ -52,6 +57,11 @@ python /path/to/skill/scripts/trace_compile.py \
   TestClass.test_method
 ```
 
+These variables are read when `trace_compile.py` starts, before it imports and
+runs the target. Export them in the shell (or place them on the same command
+line); assigning them inside the target after the wrapper has started cannot
+change the capture root.
+
 Pytest-style selectors such as `TestClass::test_method` and
 `test_file.py::TestClass::test_method` are normalized by the wrapper.
 
@@ -69,10 +79,15 @@ python /path/to/skill/scripts/trace_compile.py \
 Choose one input mode:
 
 - `values` or `1` (default): serialize one full-value input snapshot per kernel
-  invocation and share it across all of that invocation's candidates.
+  invocation and share it across all of that invocation's candidates. The
+  shared container stores the stable launch/input prefix; candidate-specific
+  runtime blocks stay in each journal record and are appended during replay.
 - `metadata`: save only scalar arguments and each Tensor's shape, stride,
   dtype, device, storage offset, and `requires_grad`; replay creates random
-  backing storage with the recorded layout.
+  backing storage with the recorded layout. Capture still writes a `.pt`
+  container for atomic in-process replay; metadata export loads that container
+  once and embeds the metadata dictionary directly instead of base64-encoding
+  the `.pt`.
 - `none` or `0`: journal diagnostics only. A launch reproducer cannot be
   created without an input artifact.
 
@@ -198,7 +213,8 @@ python /path/to/skill/scripts/repro_compile.py \
   <RECORD_ID> \
   --export "$PWD/inductor_kernel_compile_repro.py"
 
-# Compile-and-launch: also embeds the serialized input payload.
+# Compile-and-launch: embeds the captured input payload (metadata literal or
+# full-value bytes, depending on the capture mode).
 python /path/to/skill/scripts/repro_compile.py \
   "$TRITON_TRACE_CAPTURE_DIR" \
   <PRERUN_ID> \
@@ -207,9 +223,30 @@ python /path/to/skill/scripts/repro_compile.py \
 
 The launch export is one Python file and no longer depends on the capture
 directory, journal, archived source, input `.pt`, or original Inductor cache.
+Metadata mode loads the metadata-only `.pt` once during export, embeds a Python
+literal, and reconstructs deterministic synthetic storage at runtime; the `.pt`
+bytes are not embedded. Values mode retains the full-value `.pt` as base64
+because the values cannot be represented by metadata alone. Both forms use the
+direct fixed-config Triton path and do not instantiate Inductor heuristics or
+an Inductor launcher.
+
+The direct path follows the shape of a hand-written Triton repro: the exported
+kernel keeps `@triton.jit`, constructs `ASTSource` and `GPUTarget`, calls
+`triton.compile` once with the selected candidate's options, and invokes the
+compiled binary with the captured grid and arguments. It does not import or
+execute `triton_heuristics`, construct `NPUCachingAutotuner`, call
+`_precompile_config()`, or call `make_launcher()`. For `FixedGrid` and
+`PrecomputedGrid` kernels, extra `_grid_*` launcher values are separated from
+the binary's signature before the direct call.
+The resulting file is intended to look and behave like a small hand-written
+`output_code` reproducer such as
+`/Users/hp/workspace/AgentSpace/FlexAttn/test_results/output_code/test_a_batch_dynamic[dtype0-trig].py`:
+one Triton kernel, explicit inputs, one fixed launch configuration, and a
+single direct launch, with no surrounding Inductor graph or autotune search.
 To remap its inputs, set `TRITON_REPRO_MAP_LOCATION=npu:0` when running it. It
 still requires compatible Python, PyTorch, `torch_npu`, Triton, compiler,
-environment, and hardware.
+environment, and hardware. An already-exported legacy file is not rewritten in
+place; regenerate it from the capture journal with the current exporter.
 
 If a cache hit prevents the desired compiler path, isolate or bypass the cache
 only for this single-kernel replay. Verify portability by copying the export
@@ -223,6 +260,9 @@ Report:
 - generated function and Inductor kernel names;
 - journal ID, candidate ID, input group ID/mode, exact config, and runtime
   blocks;
+- direct-export signature, constexpr constants, target architecture, and
+  effective compile options (these are stored under `direct_compile` in new
+  journal records);
 - archived source, retained input, and exported reproducer paths;
 - whether failure arose in compile, pre-hook/reset, launch, or synchronization;
 - innermost error and whether direct replay and independent export reproduce;

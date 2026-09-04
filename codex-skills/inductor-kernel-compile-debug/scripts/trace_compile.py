@@ -18,6 +18,7 @@ import sys
 import threading
 import time
 import traceback
+from collections.abc import Mapping
 
 import torch
 from torch._inductor.runtime.triton_heuristics import config_to_dict
@@ -93,6 +94,14 @@ input_group_lock = threading.Lock()
 prerun_thread_state = threading.local()
 active_input_groups = {}
 archived_sources = {}
+
+# JSON object keys must be strings, while Triton ``attrs`` descriptors use
+# tuple keys such as ``(0,)``.  Keep those keys losslessly in the journal with
+# a small tagged representation.  The exporter understands this representation
+# and also accepts the plain dictionaries emitted by older captures.
+JSON_MAPPING_ITEMS = "__inductor_trace_mapping_items__"
+JSON_TUPLE = "__inductor_trace_tuple__"
+JSON_REPR = "__inductor_trace_repr__"
 original_compile = NPUCachingAutotuner._precompile_config
 original_benchmark_candidates = getattr(
     NPUCachingAutotuner,
@@ -200,6 +209,357 @@ def describe_value(value):
 
 def describe_arguments(values):
     return [describe_value(value) for value in values]
+
+
+def _json_safe_key(value):
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, tuple):
+        return {
+            JSON_TUPLE: [json_safe(item) for item in value],
+        }
+    return {JSON_REPR: repr(value)}
+
+
+def json_safe(value):
+    """Convert runtime metadata to a small JSON-compatible value.
+
+    The generated Triton module contains a few objects which are useful while
+    compiling (``DeviceProperties``, torch dtypes, sets, and named tuples) but
+    cannot be reconstructed from the journal's generic ``repr`` fallback.  The
+    direct standalone exporter only needs a stable subset of this information,
+    so normalize it explicitly at capture time.
+    """
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, torch.dtype):
+        return str(value)
+    if isinstance(value, Mapping):
+        items = list(value.items())
+        if all(isinstance(key, str) for key, _ in items):
+            return {key: json_safe(item) for key, item in items}
+        return {
+            JSON_MAPPING_ITEMS: [
+                [_json_safe_key(key), json_safe(item)]
+                for key, item in items
+            ]
+        }
+    if isinstance(value, (tuple, list)):
+        return [json_safe(item) for item in value]
+    if isinstance(value, (set, frozenset)):
+        values = [json_safe(item) for item in value]
+        return sorted(values, key=repr)
+    if hasattr(value, "_asdict") and callable(value._asdict):
+        return json_safe(value._asdict())
+    # DeviceProperties and a few vendor descriptors expose their state through
+    # dataclass fields rather than ``_asdict``.
+    fields = getattr(value, "__dataclass_fields__", None)
+    if fields:
+        return {
+            name: json_safe(getattr(value, name, None))
+            for name in fields
+        }
+    return repr(value)
+
+
+def _device_property(device, name, default=None):
+    if isinstance(device, Mapping):
+        return device.get(name, default)
+    return getattr(device, name, default)
+
+
+def _effective_compile_options(
+    tuner,
+    config,
+    config_dict,
+    triton_meta,
+    inductor_meta,
+):
+    """Reproduce the NPU autotuner's effective Triton option dictionary.
+
+    ``Config.kwargs`` contains both backend options and values used only by
+    Inductor's grid planner (for example ``split_axis``).  Passing the latter
+    through to the standalone compiler is harmless for some Triton releases,
+    but it makes the exported program differ from the config that actually
+    failed.  Newer ``NPUCachingAutotuner`` versions expose the same filtering
+    helper used by ``_precompile_config``; use it when available and retain a
+    conservative best-effort fallback for older versions and test doubles.
+    """
+    cfg_kwargs = getattr(config, "kwargs", None)
+    if not isinstance(cfg_kwargs, Mapping):
+        cfg_kwargs = {}
+    else:
+        # ``triton.Config`` normally omits ``None`` values, but a few vendor
+        # wrappers leave optional keys in ``kwargs``.  The autotuner's
+        # ``or default`` handling treats those as absent; preserve that
+        # behavior in the captured option snapshot.
+        cfg_kwargs = {
+            key: value for key, value in cfg_kwargs.items() if value is not None
+        }
+
+    compile_mode = (
+        cfg_kwargs.get("compile_mode") or "simd_simt_template"
+    )
+    effective = {
+        "num_warps": getattr(
+            config,
+            "num_warps",
+            config_dict.get("num_warps", 4),
+        ),
+        "num_stages": getattr(
+            config,
+            "num_stages",
+            config_dict.get("num_stages", 3),
+        ),
+        "debug": (
+            os.environ.get("INDUCTOR_ASCEND_DEBUG", "false").lower()
+            in ("true", "1")
+            and inductor_meta.get("assert_indirect_indexing", True)
+            and not inductor_meta.get("is_hip", False)
+        ),
+        "compile_mode": compile_mode,
+    }
+
+    raw_npu_options = triton_meta.get("npu_compile_options", {}) or {}
+    if not isinstance(raw_npu_options, Mapping):
+        raw_npu_options = {}
+    else:
+        raw_npu_options = {
+            key: value
+            for key, value in raw_npu_options.items()
+            if value is not None
+        }
+
+    parse_options = getattr(tuner, "parse_triton_ascend_options", None)
+    if callable(parse_options):
+        try:
+            parsed = parse_options(dict(raw_npu_options), effective)
+            if isinstance(parsed, Mapping):
+                effective = dict(parsed)
+            parsed = parse_options(cfg_kwargs, effective)
+            if isinstance(parsed, Mapping):
+                effective = dict(parsed)
+        except Exception:
+            # Metadata capture must not mask the compiler/prerun failure.  A
+            # best-effort unfiltered fallback remains useful on older vendor
+            # builds where the helper is present but not importable in the
+            # tracing process.
+            effective.update(raw_npu_options)
+            effective.update(cfg_kwargs)
+    else:
+        # Older torch_npu releases do not expose the filtering helper.  Keep
+        # the old behavior; AscendBackend.parse_options filters unknown keys
+        # again when the exported program calls triton.compile.
+        effective.update(raw_npu_options)
+        effective.update(cfg_kwargs)
+
+    if (
+        inductor_meta.get("enable_auto_blockify", False)
+        or inductor_meta.get("requires_no_linear_block_remap") is True
+    ):
+        if callable(parse_options):
+            try:
+                parsed = parse_options({"enable_auto_blockify": True}, effective)
+                if isinstance(parsed, Mapping):
+                    effective = dict(parsed)
+            except Exception:
+                effective["enable_auto_blockify"] = True
+        else:
+            effective["enable_auto_blockify"] = True
+
+    # The backend, rather than the candidate config, owns the pure-SIMT stack
+    # limit.  Capture the same value that _precompile_config uses whenever the
+    # vendor config module is available.
+    compile_mode = effective.get("compile_mode", compile_mode)
+    if compile_mode == "simt_only":
+        stack_limit = None
+        try:
+            import torch_npu._inductor.config as npu_config
+
+            stack_limit = getattr(npu_config, "simt_default_warp_stacksize", None)
+        except Exception:
+            stack_limit = getattr(tuner, "simt_stack_limit", None)
+        if stack_limit is not None:
+            effective["simt_stack_limit"] = stack_limit
+
+    return effective
+
+
+def direct_compile_metadata(tuner, config):
+    """Snapshot the inputs needed by a direct Triton compile.
+
+    This deliberately records compile metadata rather than the autotuner
+    object.  An exported reproducer can therefore instantiate ``ASTSource``
+    and call ``triton.compile`` without importing or constructing Inductor's
+    heuristics/autotuner machinery.
+    """
+    triton_meta = getattr(tuner, "triton_meta", None) or {}
+    inductor_meta = getattr(tuner, "inductor_meta", None) or {}
+    if not isinstance(triton_meta, Mapping):
+        triton_meta = {}
+    if not isinstance(inductor_meta, Mapping):
+        inductor_meta = {}
+    config_dict = {}
+    try:
+        config_dict = config_to_dict(config)
+    except Exception:
+        config_dict = {
+            **(getattr(config, "kwargs", {}) or {}),
+            "num_warps": getattr(config, "num_warps", 4),
+            "num_stages": getattr(config, "num_stages", 3),
+        }
+
+    fn = getattr(tuner, "fn", None)
+    arg_names = list(
+        getattr(fn, "arg_names", ()) or getattr(tuner, "arg_names", ()) or ()
+    )
+    raw_constexprs = tuple(getattr(fn, "constexprs", ()) or ())
+    constexpr_names = []
+    for constexpr in raw_constexprs:
+        if isinstance(constexpr, int):
+            if 0 <= constexpr < len(arg_names):
+                constexpr_names.append(arg_names[constexpr])
+        elif isinstance(constexpr, str) and constexpr in arg_names:
+            constexpr_names.append(constexpr)
+
+    raw_constants = triton_meta.get("constants", {}) or {}
+    constants = dict(raw_constants) if isinstance(raw_constants, Mapping) else {}
+    # A few older Triton builds journal constants by positional index.  The
+    # direct ASTSource API accepts names (or index tuples), so prefer names when
+    # the function signature is available.
+    for key in tuple(constants):
+        if isinstance(key, int) and 0 <= key < len(arg_names):
+            constants[arg_names[key]] = constants.pop(key)
+    cfg_kwargs = getattr(config, "kwargs", None)
+    if not isinstance(cfg_kwargs, Mapping):
+        cfg_kwargs = config_dict
+    for name in constexpr_names:
+        if name in cfg_kwargs:
+            constants[name] = cfg_kwargs[name]
+    # ``num_warps`` and ``num_stages`` can be represented as implicit
+    # constexprs on older Triton versions.  Mirror the autotuner's fallback
+    # insertion so ASTSource sees the same constants as the failed compile.
+    for name in constexpr_names:
+        if name not in constants and name in ("num_warps", "num_stages"):
+            if name in config_dict:
+                constants[name] = config_dict[name]
+
+    # ``device_props`` is the object actually used by NPUCachingAutotuner;
+    # fall back to the serialized triton_meta for older versions.
+    device = getattr(tuner, "device_props", None) or triton_meta.get("device")
+    device_type = (
+        _device_property(device, "type")
+        or triton_meta.get("device_type")
+        or "npu"
+    )
+    device_index = _device_property(device, "index", triton_meta.get("device_index", 0))
+    cc = _device_property(device, "cc", triton_meta.get("cc"))
+    warp_size = _device_property(device, "warp_size", None) or 32
+
+    # ``configs`` is the attrs descriptor used by newer Triton versions.  It
+    # is commonly absent on the NPU path; an empty attrs dict is equivalent.
+    attrs = triton_meta.get("configs")
+    if isinstance(attrs, (tuple, list)):
+        attrs = attrs[0] if attrs else {}
+    elif attrs is None:
+        attrs = {}
+    if isinstance(attrs, Mapping) and not isinstance(attrs, dict):
+        attrs = dict(attrs)
+    if not isinstance(attrs, dict):
+        # AttrsDescriptor is version-specific, but its ``to_dict`` spelling
+        # is stable across Triton-Ascend releases and can be reconstructed by
+        # the direct exporter.  Fall back to an empty mapping only when the
+        # installed descriptor does not expose that method.
+        to_dict = getattr(attrs, "to_dict", None)
+        if callable(to_dict):
+            try:
+                attrs = to_dict()
+            except Exception:
+                attrs = {}
+        else:
+            # Some legacy Triton builds expose the descriptor as a namedtuple
+            # rather than an object with ``to_dict``.
+            asdict = getattr(attrs, "_asdict", None)
+            if callable(asdict):
+                try:
+                    attrs = asdict()
+                except Exception:
+                    attrs = {}
+            else:
+                attrs = {}
+
+    effective_options = _effective_compile_options(
+        tuner,
+        config,
+        config_dict,
+        triton_meta,
+        inductor_meta,
+    )
+
+    # Grid construction only needs these fields.  Keeping the subset small
+    # also avoids leaking transient graph/profiling paths into the export.
+    grid_keys = (
+        "grid_type",
+        "split_axis",
+        "axis_names",
+        "runtime_block_arg_names",
+        "runtime_block_append_order",
+        "split_blocks",
+        "fixed_grid",
+        "precomputed_grids",
+        "group_enabled",
+        "extra_launcher_args",
+    )
+    grid_meta = {
+        key: inductor_meta[key]
+        for key in grid_keys
+        if key in inductor_meta
+    }
+
+    launch_arg_names = [
+        name for name in arg_names if name not in constexpr_names
+    ]
+    runtime_block_names = tuple(
+        grid_meta.get("runtime_block_append_order")
+        or grid_meta.get("runtime_block_arg_names")
+        or ()
+    )
+    for name in runtime_block_names:
+        if name not in launch_arg_names:
+            launch_arg_names.append(name)
+
+    return {
+        "version": 1,
+        "signature": json_safe(triton_meta.get("signature", {})),
+        "constants": json_safe(constants),
+        "attrs": json_safe(attrs),
+        "target": {
+            "backend": json_safe(device_type),
+            "arch": json_safe(cc),
+            "warp_size": json_safe(warp_size),
+        },
+        "device_index": json_safe(device_index),
+        "options": json_safe(effective_options),
+        "inductor_meta": json_safe(grid_meta),
+        "arg_names": json_safe(arg_names),
+        "constexpr_names": json_safe(constexpr_names),
+        "launch_arg_names": json_safe(launch_arg_names),
+        "runtime_block_arg_names": json_safe(runtime_block_names),
+        "base_launch_arg_names": json_safe(
+            [name for name in launch_arg_names if name not in runtime_block_names]
+        ),
+        "extra_launcher_arg_names": json_safe(
+            grid_meta.get("extra_launcher_args", ()) or ()
+        ),
+    }
+
+
+def safe_direct_compile_metadata(tuner, config):
+    """Best-effort metadata capture that can never mask the real failure."""
+    try:
+        return direct_compile_metadata(tuner, config), None
+    except Exception as error:
+        return None, f"{type(error).__name__}: {error}"
 
 
 def closure_bindings(function):
@@ -326,20 +686,43 @@ def encode_input_metadata(value):
 
 
 def build_input_payload(context):
+    # ``launch_args`` is candidate-specific: the autotuner appends a different
+    # runtime-block tuple for each candidate.  Persist only the stable input
+    # prefix in the shared container.  The journal keeps each candidate's
+    # runtime blocks and the replay/export path appends the selected tuple.
+    # If a backend inserts a non-argument prefix, retain that prefix explicitly
+    # (it is still shared by the candidate batch).
+    args = tuple(context["args"])
+    launch_args = tuple(context["launch_args"])
+    runtime_blocks = tuple(context.get("runtime_blocks", ()))
+    prefix_length = len(launch_args) - len(runtime_blocks)
+    if prefix_length < 0:
+        prefix_length = len(launch_args)
+    launch_prefix = launch_args[:prefix_length]
+    has_distinct_prefix = len(launch_prefix) != len(args) or any(
+        left is not right for left, right in zip(launch_prefix, args)
+    )
+
     if PRERUN_INPUT_MODE == "values":
-        return {
-            "format_version": 2,
+        payload = {
+            "format_version": 3,
             "capture_mode": "values",
-            "args": context["args"],
+            "args": args,
             "kwargs": context["kwargs"],
         }
+        if has_distinct_prefix:
+            payload["launch_prefix"] = launch_prefix
+        return payload
     if PRERUN_INPUT_MODE == "metadata":
-        return {
-            "format_version": 2,
+        payload = {
+            "format_version": 3,
             "capture_mode": "metadata",
-            "args": encode_input_metadata(context["args"]),
+            "args": encode_input_metadata(args),
             "kwargs": encode_input_metadata(context["kwargs"]),
         }
+        if has_distinct_prefix:
+            payload["launch_prefix"] = encode_input_metadata(launch_prefix)
+        return payload
     raise AssertionError(f"unexpected input mode: {PRERUN_INPUT_MODE}")
 
 
@@ -522,6 +905,10 @@ def measure_prerun_with_trace(kernel_call_fn):
         fn_name,
     )
     input_group, input_reused = get_input_group(context, fn_name)
+    direct_metadata, direct_metadata_error = safe_direct_compile_metadata(
+        tuner,
+        launcher.config,
+    )
     common = {
         "id": config_id,
         "fn_name": fn_name,
@@ -530,6 +917,8 @@ def measure_prerun_with_trace(kernel_call_fn):
         "original_source": original_source,
         "source_archive_error": source_archive_error,
         "config": config_to_dict(launcher.config),
+        "direct_compile": direct_metadata,
+        "direct_compile_error": direct_metadata_error,
         "candidate_id": candidate.get("candidate_id"),
         "variant_id": candidate.get("variant_id"),
         "full_config": candidate.get("full_config"),
@@ -596,6 +985,10 @@ def compile_with_trace(self, cfg, fn_name, kernel_name):
         fn_name,
     )
 
+    direct_metadata, direct_metadata_error = safe_direct_compile_metadata(
+        self,
+        cfg,
+    )
     common = {
         "id": config_id,
         "fn_name": fn_name,
@@ -604,6 +997,8 @@ def compile_with_trace(self, cfg, fn_name, kernel_name):
         "original_source": original_source,
         "source_archive_error": source_archive_error,
         "config": config_to_dict(cfg),
+        "direct_compile": direct_metadata,
+        "direct_compile_error": direct_metadata_error,
     }
 
     # Persist before entering triton.compile so a hard abort leaves evidence.
