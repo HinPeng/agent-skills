@@ -60,6 +60,12 @@ Apply this precedence:
 
 Preserve required headings, checklists, title prefixes, and issue fields. Do not embed one repository's template in the general skill. Do not report tests as passing without concrete evidence.
 
+## Keep issue and PR environment details minimal
+
+In issue and PR titles, bodies, and template fields, limit server/NPU/`torch_npu` environment information to the relevant branch or release version and broad NPU model, for example `torch_npu: 2.10.0` and `NPU: Ascend_950`. Do not include server names, aliases or IPs, detailed hardware or device identifiers, full package/build strings, environment build hashes, or exact dates/timestamps (including build dates).
+
+Apply this rule to pasted logs, validation commands, and output as well: summarize or redact environment details while preserving the relevant failure and validation result. When a template requests environment information, keep the required field and fill it with this concise summary.
+
 ## Non-negotiable safeguards
 
 - A Git remote alias is not a GitCode namespace. For a fork PR, form `head` from the namespace parsed from the fork URL plus the branch.
