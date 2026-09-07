@@ -1,0 +1,4 @@
+[[index]]
+name = "huaweicloud"
+url = "https://repo.huaweicloud.com/repository/pypi/simple"
+default = true
