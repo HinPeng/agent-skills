@@ -1,0 +1,4 @@
+interface:
+  display_name: "Inductor 单 Kernel 抽取"
+  short_description: "从生成代码或 IR 抽取独立 kernel，验证并交付精简复现"
+  default_prompt: "使用 $inductor-kernel-extract 抽取当前失败的独立复现，验证最终入口并交付必要文件、运行命令和真实日志。"
