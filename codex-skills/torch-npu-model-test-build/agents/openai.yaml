@@ -1,0 +1,4 @@
+interface:
+  display_name: "Torch Npu Model Test Build"
+  short_description: "Run torch_npu tests and build compatible wheels"
+  default_prompt: "Use $torch-npu-model-test-build to run this PyTorch model on Ascend NPU and, if needed, build and install a compatible torch_npu wheel."
