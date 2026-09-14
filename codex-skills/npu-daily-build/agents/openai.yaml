@@ -1,0 +1,4 @@
+interface:
+  display_name: "NPU 日构建环境搭建"
+  short_description: "搭建指定版本的隔离 NPU 日构建环境，核验安装、导入与编译器入口"
+  default_prompt: "使用 $npu-daily-build 搭建指定版本的日构建环境，完成构建安装和环境配套检查，给出激活命令、版本结果及恢复入口。"
