@@ -1,0 +1,4 @@
+interface:
+  display_name: "Torch Development Environments"
+  short_description: "Manage portable CPU Torch and TorchNPU uv environments"
+  default_prompt: "Use $torch-dev-env with required --env-root ABSOLUTE_PATH and optional --host SSH_HOST; omit or empty the host for local execution."
