@@ -1,4 +1,4 @@
 interface:
   display_name: "NPU 日构建环境搭建"
-  short_description: "搭建指定版本的隔离 NPU 日构建环境，核验安装、导入与编译器入口"
-  default_prompt: "使用 $npu-daily-build 搭建指定版本的日构建环境，完成构建安装和环境配套检查，给出激活命令、版本结果及恢复入口。"
+  short_description: "用 uv 搭建隔离 NPU 日构建环境，支持官方包、高并发源码构建与失败降档"
+  default_prompt: "使用 $npu-daily-build 按请求的日期或提交获取官方包或构建源码，用 uv 管理隔离环境，资源允许时以 64 并发编译、资源类失败降档续建，完成环境配套检查并给出激活入口。"
