@@ -1,0 +1,4 @@
+interface:
+  display_name: "Inductor NPU 社区用例迁移"
+  short_description: "按正式 tag 提取社区用例、初步改造 NPU、运行测试并回填 Excel 结果"
+  default_prompt: "使用 $inductor-npu-migrate 对我指定的 PyTorch 正式 tag 完成社区测试用例 NPU 初步适配、测试准备和结果回填。"
