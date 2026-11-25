@@ -46,7 +46,7 @@ flowchart TB
 - H2D/D2H 先处理布局与 dtype，满足条件时以临时张量过渡，`copy_between_host_and_device_opapi` 再选择异步任务或带同步的拷贝。异步路径还要追踪 pinned host 缓冲及中间结果的生命周期。
 - 修改时保留 in-place 返回、广播、目标 stride、格式、空 tensor 和同步语义。验证入口 `test/test_copy_.py`，重点看 mixed dtype、pinned memory、strided layout、临时量生命周期和 blocking 对照。跨设备需额外覆盖 P2P 可用性及两侧 stream 依赖。
 
-## 当前 checkout 的外部代码边界
+## 基线提交的外部代码边界
 
 | gitlink | 固定提交 | 用途 |
 |---|---|---|
